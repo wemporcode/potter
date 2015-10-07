@@ -3178,7 +3178,6 @@ static void __sched __schedule(void)
 	preempt_disable();
 	cpu = smp_processor_id();
 	rq = cpu_rq(cpu);
-	rcu_note_context_switch();
 	prev = rq->curr;
 
 	/*
@@ -3196,6 +3195,9 @@ static void __sched __schedule(void)
 
 	if (sched_feat(HRTICK))
 		hrtick_clear(rq);
+
+	local_irq_disable();
+	rcu_note_context_switch();
 
 	/*
 	 * Make sure that signal_pending_state()->signal_pending() below
