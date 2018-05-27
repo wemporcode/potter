@@ -232,13 +232,22 @@ static ssize_t clk_enable_set(struct device *dev,
 	return set_clks(fpc1020, (*buf == '1')) ? : count;
 }
 
-static ssize_t irq_get(struct device *device,
-       struct device_attribute *attribute, char *buffer)
+static ssize_t irq_get(struct device *dev,
+	struct device_attribute *attr, char *buf)
 {
-	struct fpc1020_data *fpc1020 = dev_get_drvdata(device);
-	int irq = gpio_get_value(fpc1020->irq_gpio);
+	struct fpc1020_data *f = dev_get_drvdata(dev);
+	bool irq_disabled;
+	int irq;
+	ssize_t count;
 
-	return scnprintf(buffer, PAGE_SIZE, "%i\n", irq);
+	spin_lock(&f->irq_lock);
+	irq_disabled = f->irq_disabled;
+	spin_unlock(&f->irq_lock);
+
+	irq = !irq_disabled && gpio_get_value(f->irq_gpio);
+	count = scnprintf(buf, PAGE_SIZE, "%d\n", irq);
+
+	return count;
 }
 
 static ssize_t screen_state_get(struct device *dev,
