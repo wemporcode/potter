@@ -318,17 +318,17 @@ static int fb_notifier_callback(struct notifier_block *nb,
 	return 0;
 }
 
-static irqreturn_t fpc1020_irq_handler(int irq, void *handle)
+static irqreturn_t fpc1020_irq_handler(int irq, void *dev_id)
 {
-	struct fpc1020_data *fpc1020 = handle;
+	struct fpc1020_data *f = dev_id;
 
-	dev_dbg(fpc1020->dev, "%s\n", __func__);
+	dev_dbg(f->dev, "%s\n", __func__);
 
-	if(atomic_read(&fpc1020->wakeup_enabled)){
-		pm_wakeup_event(fpc1020->dev, 5000);
+	if (f->screen_off){
+		pm_wakeup_event(f->dev, 1000);
 	}
 
-	sysfs_notify(&fpc1020->dev->kobj, NULL, dev_attr_irq.attr.name);
+	sysfs_notify(&f->dev->kobj, NULL, dev_attr_irq.attr.name);
 
 	return IRQ_HANDLED;
 }
