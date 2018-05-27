@@ -266,7 +266,7 @@ static int fpc1020_request_named_gpio(struct fpc1020_data *fpc1020,
 
 static int fpc1020_probe(struct spi_device *spi)
 {
-	struct device *dev = &spi->dev;
+   	struct device *dev = &spi->dev;
 	struct device_node *np = dev->of_node;
 	struct fpc1020_data *f;
 	int id_gpio, ret;
@@ -297,10 +297,6 @@ static int fpc1020_probe(struct spi_device *spi)
 	f->clocks_enabled = 0;
 	f->clocks_suspended = 0;
 
-	/* Request that the interrupt should be wakeable */
-	enable_irq_wake(gpio_to_irq(f->irq_gpio));
-
-
 	ret = sysfs_create_group(&dev->kobj, &attribute_group);
 	if (ret) {
 		dev_err(dev, "Could not create sysfs, ret: %d\n", ret);
@@ -326,86 +322,77 @@ static int fpc1020_probe(struct spi_device *spi)
 	return 0;
 
 err3:
-		sysfs_remove_group(&dev->kobj, &attribute_group);
+	sysfs_remove_group(&dev->kobj, &attribute_group);
 err2:
-		input_unregister_device(f->input);
-		input_free_device(f->input);
+	input_unregister_device(f->input);
+	input_free_device(f->input);
 err1:
-		devm_kfree(dev, f);
-		return ret;
+	devm_kfree(dev, f);
+	return ret;
 
 }
 
 static int fpc1020_remove(struct spi_device *spi)
 {
-	struct  fpc1020_data *fpc1020 = dev_get_drvdata(&spi->dev);
+	struct fpc1020_data *f = dev_get_drvdata(&spi->dev);
 
-	if (fpc1020->input != NULL)
-		input_free_device(fpc1020->input);
+	if (f->input != NULL)
+		input_free_device(f->input);
 
 	sysfs_remove_group(&spi->dev.kobj, &attribute_group);
-	(void)vreg_setup(fpc1020, "vdd_io", false);
-	(void)vreg_setup(fpc1020, "vcc_spi", false);
-	(void)vreg_setup(fpc1020, "vdd_ana", false);
-	dev_info(&spi->dev, "%s\n", __func__);
+	(void)vreg_setup(f, "vdd_io", false);
+	(void)vreg_setup(f, "vcc_spi", false);
+	(void)vreg_setup(f, "vdd_ana", false);
 	return 0;
 }
 
 static int fpc1020_suspend(struct spi_device *spi, pm_message_t mesg)
 {
-	struct fpc1020_data *fpc1020 = dev_get_drvdata(&spi->dev);
+	struct fpc1020_data *f = dev_get_drvdata(&spi->dev);
 
-	fpc1020->clocks_suspended = fpc1020->clocks_enabled;
-	dev_info(fpc1020->dev, "fpc1020_suspend\n");
-	if (fpc1020->clocks_suspended)
-		__set_clks(fpc1020, false);
+	f->clocks_suspended = f->clocks_enabled;
+	if (f->clocks_suspended)
+		__set_clks(f, false);
+	enable_irq_wake(gpio_to_irq(f->irq_gpio));
 	return 0;
 }
 
 static int fpc1020_resume(struct spi_device *spi)
 {
-	struct fpc1020_data *fpc1020 = dev_get_drvdata(&spi->dev);
+	struct fpc1020_data *f = dev_get_drvdata(&spi->dev);
 
-	if (fpc1020->clocks_suspended) {
-		dev_info(fpc1020->dev, "fpc1020_resume\n");
-		__set_clks(fpc1020, true);
-	}
+	if (f->clocks_suspended)
+		__set_clks(f, true);
+	disable_irq_wake(gpio_to_irq(f->irq_gpio));
 	return 0;
 }
 
 static struct of_device_id fpc1020_of_match[] = {
 	{ .compatible = "fpc,fpc1020", },
-	{}
+	{ }
 };
 MODULE_DEVICE_TABLE(of, fpc1020_of_match);
 
 static struct spi_driver fpc1020_driver = {
+	.probe		= fpc1020_probe,
 	.driver = {
 		.name	= "fpc1020",
 		.owner	= THIS_MODULE,
 		.of_match_table = fpc1020_of_match,
 	},
-	.probe		= fpc1020_probe,
-	.remove		= fpc1020_remove,
-	.suspend	= fpc1020_suspend,
-	.resume		= fpc1020_resume,
+	.remove = fpc1020_remove,
+	.suspend = fpc1020_suspend,
+	.resume = fpc1020_resume,
 };
 
 static int __init fpc1020_init(void)
 {
-	int rc = spi_register_driver(&fpc1020_driver);
-
-	if (!rc)
-		pr_debug("%s OK\n", __func__);
-	else
-		pr_err("%s %d\n", __func__, rc);
-	return rc;
+	return spi_register_driver(&fpc1020_driver);
 }
 
 static void __exit fpc1020_exit(void)
 {
-	pr_debug("%s\n", __func__);
-	spi_unregister_driver(&fpc1020_driver);
+	return spi_unregister_driver(&fpc1020_driver);
 }
 
 module_init(fpc1020_init);
