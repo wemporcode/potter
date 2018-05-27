@@ -185,6 +185,10 @@ static int set_clks(struct fpc1020_data *fpc1020, bool enable)
 	return 0;
 }
 
+/*
+ * sysfs node to check the interrupt status of the sensor, the interrupt
+ * handler should perform sysf_notify to allow userland to poll the node.
+ */
 static ssize_t dev_enable_set(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -195,7 +199,6 @@ static ssize_t dev_enable_set(struct device *dev,
 	dev_dbg(fpc1020->dev, "%s state = %d\n", __func__, state);
 	return 1;
 }
-static DEVICE_ATTR(dev_enable, S_IWUSR | S_IWGRP, NULL, dev_enable_set);
 
 static ssize_t clk_enable_set(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
@@ -204,17 +207,18 @@ static ssize_t clk_enable_set(struct device *dev,
 
 	return set_clks(fpc1020, (*buf == '1')) ? : count;
 }
-static DEVICE_ATTR(clk_enable, S_IWUSR | S_IWGRP, NULL, clk_enable_set);
 
 static ssize_t irq_get(struct device *device,
-		       struct device_attribute *attribute,
-		       char *buffer)
+       struct device_attribute *attribute, char *buffer)
 {
 	struct fpc1020_data *fpc1020 = dev_get_drvdata(device);
 	int irq = gpio_get_value(fpc1020->irq_gpio);
 
 	return scnprintf(buffer, PAGE_SIZE, "%i\n", irq);
 }
+
+static DEVICE_ATTR(dev_enable, S_IWUSR | S_IWGRP, NULL, dev_enable_set);
+static DEVICE_ATTR(clk_enable, S_IWUSR | S_IWGRP, NULL, clk_enable_set);
 static DEVICE_ATTR(irq, S_IRUSR | S_IRGRP, irq_get, NULL);
 
 static struct attribute *attributes[] = {
@@ -263,81 +267,73 @@ static int fpc1020_request_named_gpio(struct fpc1020_data *fpc1020,
 static int fpc1020_probe(struct spi_device *spi)
 {
 	struct device *dev = &spi->dev;
-	int rc = 0;
-	int irqf;
 	struct device_node *np = dev->of_node;
-	struct fpc1020_data *fpc1020 = devm_kzalloc(dev, sizeof(*fpc1020),
-			GFP_KERNEL);
-	if (!fpc1020) {
-		rc = -ENOMEM;
-		goto exit;
-	}
-
-	fpc1020->dev = dev;
-	dev_set_drvdata(dev, fpc1020);
-	fpc1020->spi = spi;
+	struct fpc1020_data *f;
+	int id_gpio, ret;
 
 	if (!np) {
 		dev_err(dev, "no of node found\n");
-		rc = -EINVAL;
-		goto exit;
+		return -EINVAL;
 	}
 
-	rc = fpc1020_request_named_gpio(fpc1020, "fpc,gpio_irq",
-			&fpc1020->irq_gpio);
-	gpio_direction_input(fpc1020->irq_gpio);
-	rc = fpc1020_request_named_gpio(fpc1020, "fpc,gpio_rst",
-			&fpc1020->rst_gpio);
-	if (rc)
-		goto exit;
-	gpio_direction_output(fpc1020->rst_gpio, 1);
-	gpio_export(fpc1020->rst_gpio, 1);
-	fpc1020->iface_clk = clk_get(dev, "iface_clk");
-	if (IS_ERR(fpc1020->iface_clk)) {
-		dev_err(dev, "%s: Failed to get iface_clk\n", __func__);
-		rc = -EINVAL;
-		goto exit;
+	f = devm_kzalloc(dev, sizeof(*f), GFP_KERNEL);
+	if (!f) {
+		dev_err(dev, "devm_kzalloc failed for struct fpc1020_data\n");
+		return -ENOMEM;
 	}
 
-	fpc1020->core_clk = clk_get(dev, "core_clk");
-	if (IS_ERR(fpc1020->core_clk)) {
-		dev_err(dev, "%s: Failed to get core_clk\n", __func__);
-		rc = -EINVAL;
-		goto exit;
-	}
+	f->dev = dev;
+	dev_set_drvdata(dev, f);
+	f->spi = spi;
 
-	fpc1020->clocks_enabled = 0;
-	fpc1020->clocks_suspended = 0;
-	irqf = IRQF_TRIGGER_RISING | IRQF_ONESHOT;
+	ret = fpc1020_request_named_gpio(f, "fpc,gpio_irq", &f->irq_gpio);
+	if (ret)
+		goto err1;
 
-	rc = devm_request_threaded_irq(dev, gpio_to_irq(fpc1020->irq_gpio),
-			NULL, fpc1020_irq_handler, irqf,
-			dev_name(dev), fpc1020);
-	if (rc) {
-		dev_err(dev, "could not request irq %d\n",
-				gpio_to_irq(fpc1020->irq_gpio));
-		goto exit;
-	}
-	dev_dbg(dev, "requested irq %d\n", gpio_to_irq(fpc1020->irq_gpio));
+	ret = fpc1020_request_named_gpio(f, "fpc,gpio_rst", &f->rst_gpio);
+	if (ret)
+		goto err1;
+
+	f->clocks_enabled = 0;
+	f->clocks_suspended = 0;
 
 	/* Request that the interrupt should be wakeable */
-	enable_irq_wake(gpio_to_irq(fpc1020->irq_gpio));
+	enable_irq_wake(gpio_to_irq(f->irq_gpio));
 
 
-	rc = sysfs_create_group(&dev->kobj, &attribute_group);
-	if (rc) {
-		dev_err(dev, "could not create sysfs\n");
-		goto exit;
+	ret = sysfs_create_group(&dev->kobj, &attribute_group);
+	if (ret) {
+		dev_err(dev, "Could not create sysfs, ret: %d\n", ret);
+		goto err2;
+	}
+
+	ret = devm_request_threaded_irq(dev, gpio_to_irq(f->irq_gpio),
+			NULL, fpc1020_irq_handler,
+			IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+			dev_name(dev), f);
+	if (ret) {
+		dev_err(dev, "Could not request irq, ret: %d\n", ret);
+		goto err3;
 	}
 
 	if (of_property_read_bool(dev->of_node, "fpc,enable-on-boot")) {
-		dev_dbg(dev, "Enabling hardware\n");
-		set_clks(fpc1020, true);
+		set_clks(f, true);
 	}
 
-	dev_info(dev, "%s: ok\n", __func__);
-exit:
-	return rc;
+	gpio_direction_input(f->irq_gpio);
+	gpio_direction_output(f->rst_gpio, 1);
+
+	return 0;
+
+err3:
+		sysfs_remove_group(&dev->kobj, &attribute_group);
+err2:
+		input_unregister_device(f->input);
+		input_free_device(f->input);
+err1:
+		devm_kfree(dev, f);
+		return ret;
+
 }
 
 static int fpc1020_remove(struct spi_device *spi)
