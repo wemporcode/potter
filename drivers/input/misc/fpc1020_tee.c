@@ -10,6 +10,7 @@
 
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/fb.h>
 #include <linux/gpio.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
@@ -37,19 +38,24 @@ static const struct vreg_config vreg_conf[] = {
 };
 
 struct fpc1020_data {
-	struct device *dev;
-	struct spi_device *spi;
 	struct clk *iface_clk;
 	struct clk *core_clk;
 	struct regulator *vreg[ARRAY_SIZE(vreg_conf)];
 
+	struct device *dev;
+	struct spi_device *spi;
 	struct input_dev *input;
+	struct notifier_block fb_notif;
+	struct work_struct pm_work;
+	spinlock_t irq_lock;
+
+	bool irq_disabled;
+	int clocks_enabled;
+	int clocks_suspended;
+	bool screen_off;
 
 	int irq_gpio;
 	int rst_gpio;
-
-	int clocks_enabled;
-	int clocks_suspended;
 
 	atomic_t wakeup_enabled; /* Used both in ISR and non-ISR */
 };
@@ -185,6 +191,24 @@ static int set_clks(struct fpc1020_data *fpc1020, bool enable)
 	return 0;
 }
 
+static void set_fpc_irq(struct fpc1020_data *f, bool enable)
+{
+	bool irq_disabled;
+
+	spin_lock(&f->irq_lock);
+	irq_disabled = f->irq_disabled;
+	f->irq_disabled = !enable;
+	spin_unlock(&f->irq_lock);
+
+	if (enable == !irq_disabled)
+		return;
+
+	if (enable)
+		enable_irq(gpio_to_irq(f->irq_gpio));
+	else
+		disable_irq(gpio_to_irq(f->irq_gpio));
+}
+
 /*
  * sysfs node to check the interrupt status of the sensor, the interrupt
  * handler should perform sysf_notify to allow userland to poll the node.
@@ -217,20 +241,82 @@ static ssize_t irq_get(struct device *device,
 	return scnprintf(buffer, PAGE_SIZE, "%i\n", irq);
 }
 
+static ssize_t screen_state_get(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct fpc1020_data *f = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", !f->screen_off);
+}
+
 static DEVICE_ATTR(dev_enable, S_IWUSR | S_IWGRP, NULL, dev_enable_set);
 static DEVICE_ATTR(clk_enable, S_IWUSR | S_IWGRP, NULL, clk_enable_set);
 static DEVICE_ATTR(irq, S_IRUSR | S_IRGRP, irq_get, NULL);
+static DEVICE_ATTR(screen_state, S_IRUSR, screen_state_get, NULL);
 
 static struct attribute *attributes[] = {
 	&dev_attr_dev_enable.attr,
 	&dev_attr_clk_enable.attr,
 	&dev_attr_irq.attr,
+	&dev_attr_screen_state.attr,
 	NULL
 };
 
 static const struct attribute_group attribute_group = {
 	.attrs = attributes,
 };
+
+static void set_fingerprint_hal_nice(int nice)
+{
+	struct task_struct *p;
+
+	read_lock(&tasklist_lock);
+	for_each_process(p) {
+		if(!memcmp(p->comm, "fps_work", 9)) {
+			set_user_nice(p, nice);
+			break;
+		}
+	}
+	read_unlock(&tasklist_lock);
+}
+
+static void fpc1020_suspend_resume(struct work_struct *work)
+{
+	struct fpc1020_data *f = container_of(work, typeof(*f), pm_work);
+
+	/* Escalate fingerprintd priority when screen is off */
+	if (f->screen_off) {
+		set_fingerprint_hal_nice(MIN_NICE);
+	} else {
+		set_fpc_irq(f, true);
+		set_fingerprint_hal_nice(0);
+	}
+
+	sysfs_notify(&f->dev->kobj, NULL, dev_attr_screen_state.attr.name);
+}
+
+static int fb_notifier_callback(struct notifier_block *nb,
+		unsigned long action, void *data)
+{
+	struct fpc1020_data *f = container_of(nb, typeof(*f), fb_notif);
+	struct fb_event *evdata = data;
+	int *blank = evdata->data;
+
+	if (action != FB_EARLY_EVENT_BLANK)
+		return 0;
+
+	if (*blank == FB_BLANK_UNBLANK) {
+		cancel_work_sync(&f->pm_work);
+		f->screen_off = false;
+		queue_work(system_highpri_wq, &f->pm_work);
+	} else if (*blank == FB_BLANK_POWERDOWN) {
+		cancel_work_sync(&f->pm_work);
+		f->screen_off = true;
+		queue_work(system_highpri_wq, &f->pm_work);
+	}
+
+	return 0;
+}
 
 static irqreturn_t fpc1020_irq_handler(int irq, void *handle)
 {
@@ -294,6 +380,8 @@ static int fpc1020_probe(struct spi_device *spi)
 	if (ret)
 		goto err1;
 
+	spin_lock_init(&f->irq_lock);
+	INIT_WORK(&f->pm_work, fpc1020_suspend_resume);
 	f->clocks_enabled = 0;
 	f->clocks_suspended = 0;
 
@@ -312,6 +400,13 @@ static int fpc1020_probe(struct spi_device *spi)
 		goto err3;
 	}
 
+	f->fb_notif.notifier_call = fb_notifier_callback;
+	ret = fb_register_client(&f->fb_notif);
+	if (ret) {
+		dev_err(dev, "Unable to register fb_notifier, ret: %d\n", ret);
+		goto err4;
+	}
+
 	if (of_property_read_bool(dev->of_node, "fpc,enable-on-boot")) {
 		set_clks(f, true);
 	}
@@ -320,7 +415,8 @@ static int fpc1020_probe(struct spi_device *spi)
 	gpio_direction_output(f->rst_gpio, 1);
 
 	return 0;
-
+err4:
+        devm_free_irq(dev, gpio_to_irq(f->irq_gpio), f);
 err3:
 	sysfs_remove_group(&dev->kobj, &attribute_group);
 err2:
@@ -329,7 +425,6 @@ err2:
 err1:
 	devm_kfree(dev, f);
 	return ret;
-
 }
 
 static int fpc1020_remove(struct spi_device *spi)
