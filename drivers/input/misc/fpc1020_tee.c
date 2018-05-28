@@ -56,8 +56,6 @@ struct fpc1020_data {
 
 	int irq_gpio;
 	int rst_gpio;
-
-	atomic_t wakeup_enabled; /* Used both in ISR and non-ISR */
 };
 
 static int vreg_setup(struct fpc1020_data *fpc1020, const char *name,
@@ -125,7 +123,6 @@ static int __set_clks(struct fpc1020_data *fpc1020, bool enable)
 
 	if (enable) {
 		dev_dbg(fpc1020->dev, "setting clk rates\n");
-		atomic_set(&fpc1020->wakeup_enabled, 1);
 		rc = clk_set_rate(fpc1020->core_clk,
 				fpc1020->spi->max_speed_hz);
 		if (rc) {
@@ -160,7 +157,6 @@ static int __set_clks(struct fpc1020_data *fpc1020, bool enable)
 		dev_dbg(fpc1020->dev, "disabling clks\n");
 		clk_disable_unprepare(fpc1020->iface_clk);
 		clk_disable_unprepare(fpc1020->core_clk);
-		atomic_set(&fpc1020->wakeup_enabled, 0);
 	}
 
 out:
@@ -331,8 +327,6 @@ static irqreturn_t fpc1020_irq_handler(int irq, void *dev_id)
 {
 	struct fpc1020_data *f = dev_id;
 
-	dev_dbg(f->dev, "%s\n", __func__);
-
 	if (f->screen_off){
 		pm_wakeup_event(f->dev, 1000);
 	}
@@ -342,20 +336,27 @@ static irqreturn_t fpc1020_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static int fpc1020_request_named_gpio(struct fpc1020_data *fpc1020,
-		const char *label, int *gpio)
+static int fpc1020_request_named_gpio(struct fpc1020_data *f,
+	const char *label, int *gpio)
 {
-	struct device *dev = fpc1020->dev;
+	struct device *dev = f->dev;
 	struct device_node *np = dev->of_node;
-	int rc;
+	int ret;
 
-	*gpio = of_get_named_gpio(np, label, 0);
-	rc = devm_gpio_request(dev, *gpio, label);
-	if (rc) {
-		dev_err(dev, "failed to request gpio %d\n", *gpio);
-		return rc;
+	ret = of_get_named_gpio(np, label, 0);
+	if (ret < 0) {
+		dev_err(dev, "failed to get '%s'\n", label);
+		return ret;
 	}
-	dev_dbg(dev, "%s %d\n", label, *gpio);
+
+	*gpio = ret;
+
+	ret = devm_gpio_request(dev, *gpio, label);
+	if (ret) {
+		dev_err(dev, "failed to request gpio %d\n", *gpio);
+		return ret;
+	}
+
 	return 0;
 }
 
@@ -422,6 +423,7 @@ static int fpc1020_probe(struct spi_device *spi)
 
 	gpio_direction_input(f->irq_gpio);
 	gpio_direction_output(f->rst_gpio, 1);
+	device_init_wakeup(dev, true);
 
 	return 0;
 err4:
