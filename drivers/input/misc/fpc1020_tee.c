@@ -365,7 +365,7 @@ static int fpc1020_probe(struct spi_device *spi)
    	struct device *dev = &spi->dev;
 	struct device_node *np = dev->of_node;
 	struct fpc1020_data *f;
-	int id_gpio, ret;
+	int ret;
 
 	if (!np) {
 		dev_err(dev, "no of node found\n");
